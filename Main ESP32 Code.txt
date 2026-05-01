@@ -1,0 +1,173 @@
+#include <Arduino.h>
+#include "esp_sleep.h"
+
+HardwareSerial LoRaSerial(2);
+
+// LoRa UART pins
+#define LORA_RX 16
+#define LORA_TX 17
+
+// Ultrasonic sensor pins
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+// Battery ADC pin
+#define BATTERY_PIN 34
+
+// Deep sleep time: 1 minute
+#define SLEEP_TIME_US 60000000ULL
+
+// --------- Settings ----------
+const int NUM_READINGS = 5;
+const int DEST_ADDR = 1;   // laptop-side LoRa address
+// ----------------------------
+
+// Read one ultrasonic distance in cm
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30 ms timeout
+
+  if (duration == 0) {
+    return -1.0; // no echo
+  }
+
+  return duration * 0.034 / 2.0;
+}
+
+// Read battery voltage using 100k / 100k divider
+float readBatteryVoltage() {
+  int raw = analogRead(BATTERY_PIN);
+  float adcVoltage = (raw / 4095.0) * 3.3;
+  float batteryVoltage = adcVoltage * 2.0; // divider halves voltage
+  return batteryVoltage;
+}
+
+// Sort helper for median
+void sortArray(float arr[], int n) {
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (arr[j] < arr[i]) {
+        float tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+    }
+  }
+}
+
+// Median of valid readings only
+float medianOfValid(float arr[], int n) {
+  float valid[NUM_READINGS];
+  int count = 0;
+
+  for (int i = 0; i < n; i++) {
+    if (arr[i] > 0) {
+      valid[count++] = arr[i];
+    }
+  }
+
+  if (count == 0) {
+    return -1.0;
+  }
+
+  sortArray(valid, count);
+
+  if (count % 2 == 1) {
+    return valid[count / 2];
+  } else {
+    return (valid[count / 2 - 1] + valid[count / 2]) / 2.0;
+  }
+}
+
+void sendLoRaMessage(const String &payload) {
+  String cmd = "AT+SEND=" + String(DEST_ADDR) + "," + String(payload.length()) + "," + payload;
+  LoRaSerial.print(cmd);
+  LoRaSerial.print("\r\n");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println();
+  Serial.println("ESP32 woke up");
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  analogReadResolution(12);
+
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  delay(500); // let LoRa settle
+
+  float readings[NUM_READINGS];
+
+  // Take 5 readings
+  for (int i = 0; i < NUM_READINGS; i++) {
+    readings[i] = readDistanceCm();
+
+    Serial.print("Reading ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+
+    if (readings[i] < 0) {
+      Serial.println("NO_ECHO");
+    } else {
+      Serial.print(readings[i], 1);
+      Serial.println(" cm");
+    }
+
+    delay(250);
+  }
+
+  // Median of valid readings
+  float medianDist = medianOfValid(readings, NUM_READINGS);
+
+  Serial.println();
+  if (medianDist < 0) {
+    Serial.println("Median distance: NO_ECHO");
+  } else {
+    Serial.print("Median distance: ");
+    Serial.print(medianDist, 1);
+    Serial.println(" cm");
+  }
+
+  // Battery
+  float battery = readBatteryVoltage();
+  Serial.print("Battery: ");
+  Serial.print(battery, 2);
+  Serial.println(" V");
+
+  // Build payload
+  String payload =
+    "r1=" + String(readings[0], 1) +
+    ",r2=" + String(readings[1], 1) +
+    ",r3=" + String(readings[2], 1) +
+    ",r4=" + String(readings[3], 1) +
+    ",r5=" + String(readings[4], 1) +
+    ",med=" + String(medianDist, 1) +
+    ",batt=" + String(battery, 2);
+
+  Serial.println();
+  Serial.print("Sending: ");
+  Serial.println(payload);
+
+  sendLoRaMessage(payload);
+
+  delay(1000); // let LoRa finish sending
+
+  Serial.println("Going to sleep for 1 minute...");
+  delay(100);
+
+  esp_sleep_enable_timer_wakeup(SLEEP_TIME_US);
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  // never used
+}
